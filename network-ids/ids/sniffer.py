@@ -6,6 +6,7 @@ Requires root / CAP_NET_RAW privileges.
 import time
 import threading
 import logging
+from collections import defaultdict  # Added for tracking per-IP traffic distribution
 
 log = logging.getLogger("IDS.sniffer")
 
@@ -37,54 +38,61 @@ class Sniffer:
         self._thread   = None
 
         # Bandwidth tracking
-        self._byte_window: list = []    # list of (timestamp, pkt_len)
-        self._bw_lock = threading.Lock()
-        self._bw_thread = threading.Thread(target=self._bandwidth_monitor,
-                                           daemon=True)
-
-    # ─────────────────────── Public API ──────────────────────────────
+        self._byte_window: list = []    # list of (timestamp, src_ip, pkt_len)
+        self._bw_lock  = threading.Lock()
 
     def start(self):
-        log.info("Starting sniffer on interface: %s", self.iface or "default")
-        self._bw_thread.start()
+        """Start sniffing in a background thread."""
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+        # Start the background bandwidth calculation thread
+        threading.Thread(target=self._bandwidth_monitor, daemon=True).start()
+
     def stop(self):
+        """Stop the sniffing thread."""
         self._stop.set()
-        log.info("Sniffer stopped.")
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
     def join(self):
         if self._thread:
             self._thread.join()
 
-    # ─────────────────────── Internals ───────────────────────────────
-
     def _run(self):
-        sniff(
-            iface=self.iface,
-            filter=self.bpf_filter,
-            prn=self._process_packet,
-            store=False,
-            stop_filter=lambda _: self._stop.is_set(),
-        )
+        """Internal sniffer execution."""
+        try:
+            sniff(
+                iface=self.iface,
+                filter=self.bpf_filter,
+                prn=self._process_packet,
+                stop_filter=lambda p: self._stop.is_set(),
+                store=False
+            )
+        except Exception as e:
+            log.error(f"Sniffer error: {e}")
 
     def _process_packet(self, pkt):
+        """Callback executed for every sniffed packet."""
         if not pkt.haslayer(IP):
             return
 
         src_ip = pkt[IP].src
         pkt_len = len(pkt)
 
-        # ── Bandwidth tracking ──
+        # 1. Bandwidth tracking: log the packet metadata including source IP
         with self._bw_lock:
-            self._byte_window.append((time.time(), pkt_len))
+            self._byte_window.append((time.time(), src_ip, pkt_len))
 
-        # ── ICMP → Ping Flood ──
-        if pkt.haslayer(ICMP) and pkt[ICMP].type == 8:   # Echo Request
-            self.detector.check_ping_flood(src_ip)
+        # 2. Ping Flood detection: extract ICMP
+        if pkt.haslayer(ICMP):
+            icmp_type = pkt[ICMP].type
+            if icmp_type == 8:  # Echo Request
+                self.detector.check_ping_flood(src_ip)
+            return
 
-        # ── TCP ──
+        # 3. Port Scan & Brute Force detection: extract TCP
         if pkt.haslayer(TCP):
             tcp   = pkt[TCP]
             flags = tcp.flags
@@ -110,14 +118,31 @@ class Sniffer:
         while not self._stop.is_set():
             time.sleep(1)
             now = time.time()
+            
             with self._bw_lock:
                 # Keep only packets from the last 1 second
-                recent = [(t, b) for t, b in self._byte_window if now - t < 1.0]
+                recent = [(t, ip, b) for t, ip, b in self._byte_window if now - t < 1.0]
                 self._byte_window = recent
-                total = sum(b for _, b in recent)
-            self.detector.check_traffic_spike(float(total))
+                
+                # Calculate grand total bandwidth in this window
+                total = sum(b for _, _, b in recent)
+                
+                # Group bytes by their source IP to attribute the spike source
+                ip_distribution = defaultdict(int)
+                for _, ip, b in recent:
+                    ip_distribution[ip] += b
+
+            # Analyze the top talker in this window
+            top_talker = "N/A"
+            if ip_distribution:
+                culprit_ip = max(ip_distribution, key=ip_distribution.get)
+                # Identify them if they are responsible for more than 50% of the window's traffic
+                if ip_distribution[culprit_ip] > (total * 0.5):
+                    top_talker = culprit_ip
+
+            # Pass both overall bytes and the top talker IP to the detector
+            self.detector.check_traffic_spike(float(total), top_talker)
 
 
 def _port_to_service(port: int) -> str:
-    return {22: "SSH", 21: "FTP", 23: "Telnet",
-            3389: "RDP", 5900: "VNC"}.get(port, f"port-{port}")
+    return {22: "SSH", 21: "FTP", 23: "Telnet", 3389: "RDP", 5900: "VNC"}.get(port, "UNK")
