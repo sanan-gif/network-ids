@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network IDS Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; }
+  header {
+    background: #111; border-bottom: 2px solid #00ff88;
+    padding: 14px 24px; display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 1.3rem; color: #00ff88; letter-spacing: 2px; }
+  header .dot { width: 12px; height: 12px; border-radius: 50%;
+    background: #00ff88; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    padding: 20px; }
+  .card { background: #181818; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 18px; }
+  .card h2 { font-size: 0.75rem; color: #888; letter-spacing: 1px; margin-bottom: 8px; }
+  .card .val { font-size: 2rem; font-weight: bold; }
+  .card.total   .val { color: #00ff88; }
+  .card.portscan .val { color: #ffd700; }
+  .card.ping    .val { color: #ff4444; }
+  .card.brute   .val { color: #ff7700; }
+  .card.spike   .val { color: #00bfff; }
+
+  .section { padding: 0 20px 20px; }
+  .section h2 { color: #00ff88; font-size: 0.85rem; letter-spacing: 2px;
+    margin-bottom: 12px; border-bottom: 1px solid #2a2a2a; padding-bottom: 6px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th { background: #1e1e1e; color: #888; text-align: left;
+    padding: 8px 10px; font-size: 0.7rem; letter-spacing: 1px; }
+  td { padding: 7px 10px; border-bottom: 1px solid #1a1a1a; }
+  tr:hover td { background: #1c1c1c; }
+
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.7rem; font-weight: bold; letter-spacing: 1px;
+  }
+  .badge-PORT_SCAN   { background:#3a3000; color:#ffd700; border:1px solid #ffd700; }
+  .badge-PING_FLOOD  { background:#3a0000; color:#ff4444; border:1px solid #ff4444; }
+  .badge-BRUTE_FORCE { background:#3a1500; color:#ff7700; border:1px solid #ff7700; }
+  .badge-TRAFFIC_SPIKE{ background:#001a2a; color:#00bfff; border:1px solid #00bfff; }
+
+  .btn {
+    background: #1e1e1e; border: 1px solid #333; color: #ccc;
+    padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 0.75rem;
+  }
+  .btn:hover { border-color: #ff4444; color: #ff4444; }
+  .topbar { padding: 10px 20px; display:flex; justify-content:space-between; align-items:center; }
+  .refresh-info { font-size: 0.7rem; color: #555; }
+
+  #no-events { text-align: center; color: #444; padding: 30px; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot"></div>
+  <h1>🛡 NETWORK INTRUSION DETECTION SYSTEM</h1>
+</header>
+
+<div class="grid">
+  <div class="card total">
+    <h2>TOTAL ALERTS</h2>
+    <div class="val" id="stat-total">–</div>
+  </div>
+  <div class="card portscan">
+    <h2>PORT SCANS</h2>
+    <div class="val" id="stat-ps">–</div>
+  </div>
+  <div class="card ping">
+    <h2>PING FLOODS</h2>
+    <div class="val" id="stat-pf">–</div>
+  </div>
+  <div class="card brute">
+    <h2>BRUTE FORCE</h2>
+    <div class="val" id="stat-bf">–</div>
+  </div>
+</div>
+
+<div class="topbar">
+  <span class="refresh-info">Auto-refresh every 5 seconds</span>
+  <button class="btn" onclick="clearLog()">🗑 Clear Log</button>
+</div>
+
+<div class="section">
+  <h2>RECENT ALERTS</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>TIMESTAMP</th>
+        <th>TYPE</th>
+        <th>SOURCE IP</th>
+        <th>DETAIL</th>
+      </tr>
+    </thead>
+    <tbody id="events-body">
+      <tr><td colspan="4" id="no-events">No alerts yet — monitoring active...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+async function fetchStats() {
+  const r = await fetch('/api/stats');
+  const d = await r.json();
+  document.getElementById('stat-total').textContent = d.total;
+  const t = d.by_type || {};
+  document.getElementById('stat-ps').textContent  = t.PORT_SCAN    || 0;
+  document.getElementById('stat-pf').textContent  = t.PING_FLOOD   || 0;
+  document.getElementById('stat-bf').textContent  = t.BRUTE_FORCE  || 0;
+}
+
+async function fetchEvents() {
+  const r = await fetch('/api/events');
+  const events = await r.json();
+  const tbody = document.getElementById('events-body');
+  if (!events.length) {
+    tbody.innerHTML = '<tr><td colspan="4" id="no-events">No alerts yet — monitoring active...</td></tr>';
+    return;
+  }
+  const rows = events.slice().reverse().map(e => `
+    <tr>
+      <td>${e.timestamp.replace('T',' ').split('.')[0]}</td>
+      <td><span class="badge badge-${e.attack}">${e.attack}</span></td>
+      <td>${e.src_ip}</td>
+      <td>${e.detail}</td>
+    </tr>`).join('');
+  tbody.innerHTML = rows;
+}
+
+async function clearLog() {
+  if (!confirm('Clear all alert logs?')) return;
+  await fetch('/api/clear', { method: 'POST' });
+  fetchStats(); fetchEvents();
+}
+
+function refresh() { fetchStats(); fetchEvents(); }
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
